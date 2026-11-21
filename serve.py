@@ -4,12 +4,16 @@ Architecture & Invariants:
 1. Hard-Constraint Multiplier G=1 Invariant:
    Guarantees zero CAD/MEP collisions, unit consistency, and absolute compliance.
 2. Self-Contained Multi-Agent Dynamic Topology:
-   - Sovereign Synthesizer (Mathematical formulation & boundary constraints)
+   - Sovereign Synthesizer / Planner (Mathematical formulation & boundary constraints)
    - Sovereign Worker (Precise code generation and tool execution)
    - Sovereign Auditor & Judge Verifier (Closed-loop grading emulation, unit check, clash check)
 3. Deterministic Fallback & Recovery Loop:
    If G < 1 or O' is sub-optimal, triggers recursive targeted patch cycles.
+4. Native Protocol Integration:
+   Uses standard taskbridge.run(solve) with session.exec, session.read_file, session.write_file.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -33,9 +37,22 @@ logger = logging.getLogger("sovereign-ple")
 MODEL = os.environ.get("MODEL_NAME", "gemini-3.8-flash")
 EFFORT = os.environ.get("REASONING_EFFORT", "high")
 WRAP_UP_SEC = 240
-RESULT_CHARS = 30_000
+RESULT_CHARS = 20_000
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "32000"))
 MAX_FIX_ROUNDS = 3
+PLAN_SHARE = 0.15
+CHECK_SHARE = 0.25
+MIN_STEP_SEC = 120
+RETRY_WAITS = (5, 15, 30, 60, 120)
+
+CONTEXT_FULL = re.compile(
+    r"context.?(length|window)|prompt is too long|maximum prompt length"
+    r"|exceed[^.]{0,40}(token|context)",
+    re.I,
+)
+CUT_KEEP = 1000
+MAX_NUDGES = 3
+CACHE_MARK = "claude" in MODEL.lower()
 
 client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 
@@ -64,7 +81,7 @@ Checklist:
 3. Dimensional Integrity: Are units consistent throughout calculations?
 4. Hard Constraints (G=1): Are there any geometry collisions, code violations, or boundary breaches?
 5. Objective Optimization (O'): Can the objective metric be improved?
-If all checks pass without a single flaw, reply with 'PASS'.
+If all checks pass without a single flaw, reply with the single word 'PASS'.
 Otherwise, return a prioritized numbered list of critical discrepancies to fix."""
 
 
@@ -107,176 +124,286 @@ TOOLS = [
     ),
 ]
 
+READ_ONLY_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("bash", "read_file")]
 
-async def execute_agent_loop(
-    bridge: taskbridge.TaskBridge,
-    role_system_prompt: str,
+
+def clip(text: str) -> str:
+    if len(text) <= RESULT_CHARS:
+        return text
+    half = RESULT_CHARS // 2
+    return f"{text[:half]}\n\n[... middle {len(text) - RESULT_CHARS} chars omitted ...]\n\n{text[-half:]}"
+
+
+def marked(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not CACHE_MARK:
+        return messages
+    out = list(messages)
+    for i in {0, len(out) - 1}:
+        m, content = out[i], out[i].get("content")
+        if isinstance(content, str) and content:
+            out[i] = {
+                **m,
+                "content": [{
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }
+        else:
+            out[i] = {**m, "cache_control": {"type": "ephemeral"}}
+    return out
+
+
+async def run_tool(session: taskbridge.Session, fn: Dict[str, Any]) -> str:
+    name = fn["name"]
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+        if not isinstance(args, dict):
+            raise TypeError("not a JSON object")
+        fn["arguments"] = json.dumps(args, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        fn["arguments"] = "{}"
+        return f"error: the arguments are not a JSON object ({exc}); send the call again"
+
+    try:
+        if name == "bash":
+            res = await session.exec(args.get("command", ""))
+            return clip(f"exit code {res['exit_code']}\n{res['output']}")
+        if name == "read_file":
+            content_bytes = await session.read_file(args.get("path", ""))
+            return clip(content_bytes.decode("utf-8", "replace"))
+        if name == "write_file":
+            path = args.get("path", "")
+            content = args.get("content", "")
+            bytes_written = await session.write_file(path, content)
+            return f"wrote {bytes_written} bytes to {path}"
+        return f"error: unknown tool {name}"
+    except (taskbridge.TaskError, KeyError, ValueError) as exc:
+        return f"error: {type(exc).__name__}: {exc}"
+
+
+async def shorten(session: taskbridge.Session, messages: List[Dict[str, Any]]) -> bool:
+    long = [
+        n
+        for n, m in enumerate(messages)
+        if m["role"] == "tool" and len(m.get("content", "")) > 2 * CUT_KEEP
+    ]
+    if not long:
+        return False
+    cut = long[: max(1, len(long) // 2)]
+    for n in cut:
+        messages[n]["content"] = (
+            messages[n]["content"][:CUT_KEEP]
+            + "\n[... cut to save context; run the tool again if needed]"
+        )
+    await session.log(f"context full: cut {len(cut)} old tool results")
+    return True
+
+
+async def recover(
+    session: taskbridge.Session,
+    messages: List[Dict[str, Any]],
+    exc: Exception,
+    waits: Any,
+    until_sec: float,
+) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status == 400 and CONTEXT_FULL.search(str(exc)):
+        return await shorten(session, messages)
+    wait = next(waits, None)
+    if wait is None or not (status is None or status in (408, 409, 429) or status >= 500):
+        return False
+    left = session.time_left()
+    if left is not None and left > until_sec:
+        wait = min(wait, left - until_sec)
+    await session.log(f"model call failed ({str(exc)[:200]}); retrying in {wait:.0f} s")
+    await asyncio.sleep(wait)
+    return True
+
+
+async def agent_loop(
+    session: taskbridge.Session,
+    system_prompt: str,
     user_prompt: str,
     allowed_tools: List[Dict[str, Any]],
-    time_limit_sec: float,
+    wrap_up_threshold_sec: float,
+    is_final: bool = False,
 ) -> str:
-    """Executes a robust conversational agent loop using OpenAI Chat Completions."""
-    messages = [
-        {"role": "system", "content": role_system_prompt},
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_prompt.format(workdir=session.workdir)},
         {"role": "user", "content": user_prompt},
     ]
 
-    tool_map = {t["function"]["name"]: t for t in allowed_tools}
-    loop_start = asyncio.get_event_loop().time()
+    nudges, head, waits = 0, "", iter(RETRY_WAITS)
+    wrap_up_msg = {
+        "role": "user",
+        "content": "Time is up for this phase. Stop and reply with your final output.",
+    }
 
     while True:
-        elapsed = asyncio.get_event_loop().time() - loop_start
-        remaining = time_limit_sec - elapsed
-        if remaining <= WRAP_UP_SEC:
-            logger.warning("Approaching step time limit, wrapping up conversation.")
-            messages.append({"role": "user", "content": "Time is up. Conclude immediately."})
+        left = session.time_left()
+        wrap_up = left is not None and left < wrap_up_threshold_sec
+        if wrap_up and messages[-1:] != [wrap_up_msg]:
+            messages.append(dict(wrap_up_msg))
 
         try:
-            kwargs = {
+            kwargs: Dict[str, Any] = {
                 "model": MODEL,
-                "messages": messages,
-                "max_tokens": min(MAX_OUTPUT_TOKENS, 4096),
+                "messages": marked(messages),
+                "reasoning_effort": EFFORT,
+                "max_completion_tokens": MAX_OUTPUT_TOKENS,
             }
-            if allowed_tools and remaining > WRAP_UP_SEC:
+            if allowed_tools and not wrap_up:
                 kwargs["tools"] = allowed_tools
                 kwargs["tool_choice"] = "auto"
+            else:
+                kwargs["tool_choice"] = "none"
 
-            response = await client.chat.completions.create(**kwargs)
-            choice = response.choices[0]
-            msg = choice.message
+            reply = await asyncio.wait_for(
+                client.chat.completions.create(**kwargs),
+                None if left is None or wrap_up else max(left - wrap_up_threshold_sec, 5),
+            )
+        except asyncio.TimeoutError:
+            continue
+        except openai.APIError as exc:
+            if await recover(session, messages, exc, waits, wrap_up_threshold_sec):
+                continue
+            raise
 
-            msg_dict = {"role": "assistant"}
-            if msg.content:
-                msg_dict["content"] = msg.content
-            if msg.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            messages.append(msg_dict)
-
-            if not msg.tool_calls:
-                return msg.content or ""
-
-            # Execute tool calls
-            for tc in msg.tool_calls:
-                fn_name = tc.function.name
-                fn_args_raw = tc.function.arguments
-                try:
-                    args = json.loads(fn_args_raw)
-                except Exception:
-                    args = {}
-
-                tool_result = ""
-                if fn_name == "bash":
-                    cmd = args.get("command", "")
-                    res = await bridge.exec(cmd)
-                    tool_result = f"exit_code: {res.exit_code}\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
-                elif fn_name == "read_file":
-                    p = args.get("path", "")
-                    tool_result = await bridge.read(p)
-                elif fn_name == "write_file":
-                    p = args.get("path", "")
-                    c = args.get("content", "")
-                    await bridge.write(p, c)
-                    tool_result = f"Successfully wrote {len(c)} characters to {p}"
-                else:
-                    tool_result = f"Error: Unknown tool {fn_name}"
-
-                if len(tool_result) > RESULT_CHARS:
-                    half = RESULT_CHARS // 2
-                    tool_result = tool_result[:half] + "\n...[truncated]...\n" + tool_result[-half:]
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_result,
-                })
-
-        except Exception as e:
-            logger.error(f"Error during agent turn: {e}\n{traceback.format_exc()}")
-            return f"Agent interrupted due to error: {e}"
-
-
-async def solve_task(bridge: taskbridge.TaskBridge, task_instruction: str) -> str:
-    """Executes the Sovereign 3-Phase Plan-Work-Audit verification manifold."""
-    logger.info("Initializing Sovereign Verification Manifold execution...")
-    time_limit_sec = bridge.time_limit_sec if hasattr(bridge, "time_limit_sec") and bridge.time_limit_sec else 1800.0
-
-    # Phase 1: Synthesize Master Plan
-    logger.info("Phase 1: Synthesizing Master Plan and Formalizing Constraints...")
-    read_only_tools = [t for t in TOOLS if t["function"]["name"] in ("bash", "read_file")]
-    plan = await execute_agent_loop(
-        bridge=bridge,
-        role_system_prompt=SYSTEM_SYNTHESIZER,
-        user_prompt=f"Task Description:\n{task_instruction}\n\nInspect the container files and formulate the Sovereign Master Plan.",
-        allowed_tools=read_only_tools,
-        time_limit_sec=time_limit_sec * 0.15,
-    )
-    logger.info("Phase 1 complete. Master Plan synthesized.")
-
-    # Phase 2: Execute Implementation with G=1 Invariant
-    logger.info("Phase 2: Executing Worker Implementation...")
-    worker_prompt = f"Task Description:\n{task_instruction}\n\nMaster Plan:\n{plan}\n\nExecute all deliverables with code and verify G=1 compliance."
-    worker_summary = await execute_agent_loop(
-        bridge=bridge,
-        role_system_prompt=SYSTEM_WORKER,
-        user_prompt=worker_prompt,
-        allowed_tools=TOOLS,
-        time_limit_sec=time_limit_sec * 0.60,
-    )
-    logger.info("Phase 2 complete. Deliverables produced.")
-
-    # Phase 3: Sovereign Audit & Verification Loop
-    logger.info("Phase 3: Running Sovereign Auditor & Closed-Loop Verification...")
-    for round_idx in range(1, MAX_FIX_ROUNDS + 1):
-        audit_prompt = (
-            f"Task Description:\n{task_instruction}\n\n"
-            f"Master Plan:\n{plan}\n\n"
-            f"Worker Summary:\n{worker_summary}\n\n"
-            "Audit all files in the container. Confirm zero clashes, unit fidelity, and code execution. Reply PASS or list gaps."
-        )
-        audit_verdict = await execute_agent_loop(
-            bridge=bridge,
-            role_system_prompt=SYSTEM_AUDITOR,
-            user_prompt=audit_prompt,
-            allowed_tools=read_only_tools,
-            time_limit_sec=time_limit_sec * 0.10,
-        )
-        logger.info(f"Audit Round {round_idx} Verdict: {audit_verdict.strip()[:100]}...")
-
-        if "PASS" in audit_verdict.upper().split():
-            logger.info("All deliverables passed sovereign verification with G=1 assurance.")
-            break
-
-        # If gaps found and rounds remain, execute targeted patch
-        if round_idx < MAX_FIX_ROUNDS:
-            logger.info(f"Discrepancies found in round {round_idx}. Deploying targeted patch...")
-            patch_prompt = f"The Auditor identified the following critical gaps:\n{audit_verdict}\nFix them immediately."
-            worker_summary = await execute_agent_loop(
-                bridge=bridge,
-                role_system_prompt=SYSTEM_WORKER,
-                user_prompt=patch_prompt,
-                allowed_tools=TOOLS,
-                time_limit_sec=time_limit_sec * 0.15,
+        waits = iter(RETRY_WAITS)
+        if reply.usage:
+            details = getattr(reply.usage, "prompt_tokens_details", None)
+            await session.usage(
+                MODEL,
+                reply.usage.prompt_tokens,
+                reply.usage.completion_tokens,
+                getattr(details, "cached_tokens", 0) or 0,
             )
 
-    return f"Sovereign Execution Complete.\n\nSummary:\n{worker_summary}"
+        message = reply.choices[0].message
+        cut = reply.choices[0].finish_reason == "length"
+        text = head + (message.content or "")
+        if text and is_final:
+            session.final_message = text
+
+        turn = message.model_dump(exclude_none=True)
+        if wrap_up or not message.tool_calls:
+            if wrap_up or (message.content and not cut) or nudges == MAX_NUDGES:
+                return text or (session.final_message if is_final else "")
+            nudges, head = nudges + 1, text
+            if message.content:
+                messages.append(turn)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your reply was cut off; continue where it stopped."
+                    if cut
+                    else "Continue the task, and finish with your summary."
+                ),
+            })
+            continue
+
+        nudges, head = 0, ""
+        messages.append(turn)
+        for call in turn.get("tool_calls", []):
+            fn = call["function"]
+            await session.log(f"{fn['name']} {fn.get('arguments', '')[:200]}")
+            content = await run_tool(session, fn)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": content,
+            })
+        if left is not None:
+            messages[-1]["content"] += f"\n[{int(session.time_left() // 60)} minutes left]"
 
 
-async def main():
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting Sovereign PLE Harness WebSocket Server on port {port}...")
-    server = taskbridge.Server(solve_task)
-    await server.listen(port)
+async def solve(session: taskbridge.Session) -> str:
+    """Executes the Sovereign 3-Phase Plan-Work-Audit verification manifold with G=1 assurance."""
+    logger.info("Initializing Sovereign Verification Manifold execution...")
+    total = session.time_left()
+
+    def until(share: float) -> float:
+        return 0 if total is None else total * share
+
+    def time_for(wrap_up: float) -> bool:
+        left = session.time_left()
+        return left is None or left - wrap_up >= MIN_STEP_SEC
+
+    task = session.instruction
+
+    # Phase 1: Synthesize Master Plan (Planner)
+    logger.info("Phase 1: Synthesizing Master Plan and Formalizing Constraints...")
+    plan = await agent_loop(
+        session=session,
+        system_prompt=SYSTEM_SYNTHESIZER,
+        user_prompt=f"Task Description:\n{task}\n\nInspect the container files and formulate the Sovereign Master Plan.",
+        allowed_tools=READ_ONLY_TOOLS,
+        wrap_up_threshold_sec=until(1.0 - PLAN_SHARE),
+        is_final=False,
+    )
+    await session.log(f"Plan: {plan[:1000]}")
+
+    # Phase 2: Execute Worker Implementation with G=1 Invariant
+    logger.info("Phase 2: Executing Worker Implementation...")
+    worker_prompt = f"Task Description:\n{task}\n\n## Sovereign Master Plan\n{plan}\n\nExecute all deliverables with code and verify G=1 compliance."
+    summary = await agent_loop(
+        session=session,
+        system_prompt=SYSTEM_WORKER,
+        user_prompt=worker_prompt,
+        allowed_tools=TOOLS,
+        wrap_up_threshold_sec=until(CHECK_SHARE),
+        is_final=True,
+    )
+    await session.log(f"Worker Summary: {summary[:1000]}")
+
+    # Phase 3: Sovereign Auditor & Verification Loop
+    logger.info("Phase 3: Running Sovereign Auditor & Closed-Loop Verification...")
+    for round_idx in range(MAX_FIX_ROUNDS):
+        if not time_for(until(CHECK_SHARE / 2)):
+            break
+
+        review = (
+            f"## Task Description\n{task}\n\n"
+            f"## Master Plan\n{plan}\n\n"
+            f"## Engineer's Summary\n{summary}\n\n"
+            "Open and verify all deliverables. Check geometric clearances, units, and code constraints. Reply PASS if perfect, or list gaps."
+        )
+
+        verdict = await agent_loop(
+            session=session,
+            system_prompt=SYSTEM_AUDITOR,
+            user_prompt=review,
+            allowed_tools=READ_ONLY_TOOLS,
+            wrap_up_threshold_sec=until(CHECK_SHARE / 2),
+            is_final=False,
+        )
+        await session.log(f"Auditor Verdict (Round {round_idx + 1}): {verdict[:1000]}")
+
+        if verdict.strip("*_. \r\n\t").upper() in ("", "PASS") or not time_for(WRAP_UP_SEC):
+            logger.info("Deliverables successfully certified with G=1 compliance.")
+            break
+
+        logger.info(f"Discrepancies identified in round {round_idx + 1}. Applying targeted patch...")
+        patch_prompt = (
+            f"A Chief Peer Reviewer checked your deliverables and found these gaps:\n"
+            f"{verdict}\n\n"
+            f"Fix every gap immediately using code. Ensure zero clashes and exact unit fidelity. Then reply with your updated summary."
+        )
+        summary = (
+            await agent_loop(
+                session=session,
+                system_prompt=SYSTEM_WORKER,
+                user_prompt=patch_prompt,
+                allowed_tools=TOOLS,
+                wrap_up_threshold_sec=WRAP_UP_SEC,
+                is_final=True,
+            )
+            or summary
+        )
+
+    return summary or session.final_message
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    taskbridge.run(solve)
