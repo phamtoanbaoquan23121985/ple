@@ -1,0 +1,10 @@
+name: sovereign-ple-harness
+model_api: google-cloud/gemini-3.8-flash
+install: >-
+  uv venv --python 3.12 /opt/harness/venv
+  && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
+serve: /opt/harness/venv/bin/python {src}/serve.py
+env:
+  LOG_LEVEL: "info"
+  SOVEREIGN_MODE: "hard_constraint_enforcement"
+  REASONING_EFFORT: "high"
